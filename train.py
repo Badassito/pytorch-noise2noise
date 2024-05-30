@@ -370,6 +370,7 @@ class Train:
             for i, data in enumerate(loader_test, 1):
                 input = data['input'].to(device)
                 label = data['label'].to(device)
+                input_filenames = data['input_filename']
 
                 output = netG(input)
 
@@ -386,11 +387,11 @@ class Train:
                 output = np.clip(output, 0, 1)
 
                 for j in range(label.shape[0]):
-                    name = batch_size * (i - 1) + j
+                    name = input_filenames[j]
                     fileset = {'name': name,
-                               'input': "%04d-input.png" % name,
-                               'output': "%04d-output.png" % name,
-                               'label': "%04d-label.png" % name}
+                               'input': "%s-input.png" % name,
+                               'output': "%s-output.png" % name,
+                               'label': "%s-label.png" % name}
 
                     plt.imsave(os.path.join(dir_result_test, 'images', fileset['input']), input[j, :, :, :].squeeze(), cmap=cmap)
                     plt.imsave(os.path.join(dir_result_test, 'images', fileset['output']), output[j, :, :, :].squeeze(), cmap=cmap)
