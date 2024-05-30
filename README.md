@@ -1,3 +1,8 @@
+Fork Notes:
+1. Test images will retain their original file names (probably).
+
+
+
 # Noise2Noise
 
 #### Title
