@@ -5,7 +5,6 @@ from skimage import transform
 import matplotlib.pyplot as plt
 import os
 
-
 class Dataset(torch.utils.data.Dataset):
     """
     dataset of image files of the form 
@@ -38,10 +37,27 @@ class Dataset(torch.utils.data.Dataset):
         self.lst_data = lst_data
 
     def __getitem__(self, index):
-        input_path = self.lst_data[index]
-        input_filename = os.path.basename(input_path)
+        # label = np.load(os.path.join(self.data_dir, self.lst_label[index]))
+        # input = np.load(os.path.join(self.data_dir, self.lst_input[index]))
+        #
+        # if label.dtype == np.uint8:
+        #     label = label / 255.0
+        # if input.dtype == np.uint8:
+        #     input = input / 255.0
+        #
+        # if label.ndim == 2:
+        #     label = np.expand_dims(label, axis=2)
+        # if input.ndim == 2:
+        #     input = np.expand_dims(input, axis=2)
+        #
+        # if self.ny != label.shape[0]:
+        #     label = label.transpose((1, 0, 2))
+        # if self.ny != input.shape[0]:
+        #     input = input.transpose((1, 0, 2))
+        #
+        # data = {'input': input, 'label': label}
 
-        data = plt.imread(os.path.join(self.data_dir, input_path))
+        data = plt.imread(os.path.join(self.data_dir, self.lst_data[index]))
 
         if data.dtype == np.uint8:
             data = data / 255.0
@@ -55,9 +71,9 @@ class Dataset(torch.utils.data.Dataset):
         sz = data.shape
 
         label = data + self.sgm_label / 255 * np.random.randn(sz[0], sz[1], sz[2])
-        input = data + self.sgm_input / 255 * np.random.randn(sz[0], sz[1], sz[2])
+        input = data + self.sgm_input/255 * np.random.randn(sz[0], sz[1], sz[2])
 
-        data = {'input': input, 'label': label, 'input_filename': input_filename}
+        data = {'input': input, 'label': label}
 
         if self.transform:
             data = self.transform(data)
@@ -72,18 +88,20 @@ class ToTensor(object):
     """Convert ndarrays in sample to Tensors."""
 
     def __call__(self, data):
+        # Swap color axis because numpy image: H x W x C
+        #                         torch image: C x H x W
+
+        # for key, value in data:
+        #     data[key] = torch.from_numpy(value.transpose((2, 0, 1)))
+        #
+        # return data
+
         input, label = data['input'], data['label']
 
         input = input.transpose((2, 0, 1)).astype(np.float32)
         label = label.transpose((2, 0, 1)).astype(np.float32)
+        return {'input': torch.from_numpy(input), 'label': torch.from_numpy(label)}
 
-        data['input'] = torch.from_numpy(input)
-        data['label'] = torch.from_numpy(label)
-
-        if 'input_filename' in data:
-            data['input_filename'] = data['input_filename']
-
-        return data
 
 class Normalize(object):
     def __init__(self, mean=0.5, std=0.5):
@@ -96,13 +114,9 @@ class Normalize(object):
         input = (input - self.mean) / self.std
         label = (label - self.mean) / self.std
 
-        data['input'] = input
-        data['label'] = label
-
-        if 'input_filename' in data:
-            data['input_filename'] = data['input_filename']
-
+        data = {'input': input, 'label': label}
         return data
+
 
 class RandomFlip(object):
     def __call__(self, data):
@@ -185,14 +199,9 @@ class RandomCrop(object):
     top = np.random.randint(0, h - new_h)
     left = np.random.randint(0, w - new_w)
 
-    id_y = np.arange(top, top + new_h, 1)[:, np.newaxis].astype(np.int32)
-    id_x = np.arange(left, left + new_w, 1).astype(np.int32)
-
-    # input = input[top: top + new_h, left: left + new_w]
-    # label = label[top: top + new_h, left: left + new_w]
-
-    input = input[id_y, id_x]
-    label = label[id_y, id_x]
+    # REPLACE with the standard, robust slicing method:
+    input = input[top: top + new_h, left: left + new_w]
+    label = label[top: top + new_h, left: left + new_w]
 
     return {'input': input, 'label': label}
 
@@ -284,7 +293,8 @@ class ToNumpy(object):
         #     data[key] = value.transpose((2, 0, 1)).numpy()
         #
         # return data
-
+        if data.dtype in [torch.bfloat16, torch.float16]:
+            data = data.float()
         return data.to('cpu').detach().numpy().transpose(0, 2, 3, 1)
 
         # input, label = data['input'], data['label']
