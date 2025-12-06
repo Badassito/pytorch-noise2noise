@@ -51,6 +51,16 @@ parser.add_argument('--data_type', default='float32', dest='data_type')
 parser.add_argument('--num_freq_disp', type=int,  default=1, dest='num_freq_disp')
 parser.add_argument('--num_freq_save', type=int,  default=1, dest='num_freq_save')
 
+# Performance optimization arguments
+parser.add_argument('--use_amp', action='store_true', default=True, dest='use_amp', help='Use automatic mixed precision training')
+parser.add_argument('--no_amp', action='store_false', dest='use_amp', help='Disable automatic mixed precision training')
+parser.add_argument('--use_compile', action='store_true', default=False, dest='use_compile', help='Use torch.compile() for model compilation')
+parser.add_argument('--use_grad_checkpoint', action='store_true', default=True, dest='use_grad_checkpoint', help='Use gradient checkpointing to save memory')
+parser.add_argument('--no_grad_checkpoint', action='store_false', dest='use_grad_checkpoint', help='Disable gradient checkpointing')
+parser.add_argument('--use_scheduler', action='store_true', default=True, dest='use_scheduler', help='Use cosine annealing learning rate scheduler')
+parser.add_argument('--no_scheduler', action='store_false', dest='use_scheduler', help='Disable learning rate scheduler')
+parser.add_argument('--save_images', action='store_true', default=False, dest='save_images', help='Save images during training (slower)')
+
 PARSER = Parser(parser)
 
 def main():

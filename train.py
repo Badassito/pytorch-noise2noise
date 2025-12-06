@@ -4,6 +4,8 @@ from dataset import *
 
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
@@ -53,6 +55,13 @@ class Train:
 
 		self.num_freq_disp = args.num_freq_disp
 		self.num_freq_save = args.num_freq_save
+
+		# Performance optimization flags
+		self.use_amp = getattr(args, 'use_amp', True)
+		self.use_compile = getattr(args, 'use_compile', False)
+		self.use_grad_checkpoint = getattr(args, 'use_grad_checkpoint', True)
+		self.use_scheduler = getattr(args, 'use_scheduler', True)
+		self.save_images = getattr(args, 'save_images', False)
 
 		self.gpu_ids = args.gpu_ids
 
@@ -180,11 +189,18 @@ class Train:
 		# netG = BasicUNetPlusPlus(spatial_dims=2, in_channels=1, out_channels=1, features=(64,64,128,256,512,64))
 		# netG = ELUNetPlusPlusPlus(spatial_dims=2, in_channels=1, out_channels=1, features=(32,32,64,128,256,32))
 		# netG = ELUNet(spatial_dims=2, in_channels=1, out_channels=1, features=(32,32,64,128,256,32))
-		netG = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24, use_v2=True)
+		# Enable gradient checkpointing for memory efficiency if requested
+		use_checkpoint = self.use_grad_checkpoint
+		netG = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24, use_v2=True, use_checkpoint=use_checkpoint)
 		# netG = SwinUNETRPlusPlus(img_size=(self.ny_load, self.nx_load), spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24,num_heads=(6,12,24,48), use_v2=True, drop_rate=0.2, attn_drop_rate=0.2, dropout_path_rate=0.2, downsample="mergingv2")
 		netG = netG.to(memory_format=torch.channels_last)
 
 		init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
+
+		# Apply torch.compile for faster training (PyTorch 2.0+)
+		if self.use_compile:
+			print("Compiling model with torch.compile()...")
+			netG = torch.compile(netG, mode='reduce-overhead')
 
 		## setup loss & optimization
 		# fn_REG = nn.L1Loss().to(device)  # Regression loss: L1
@@ -195,6 +211,18 @@ class Train:
 		paramsG = netG.parameters()
 
 		optimG = torch.optim.Adam(paramsG, lr=lr_G, betas=(self.beta1, 0.999), fused=True)
+
+		# Setup GradScaler for mixed precision training
+		scaler = GradScaler('cuda', enabled=self.use_amp)
+		if self.use_amp:
+			print("Mixed precision training (AMP) enabled")
+
+		# Setup learning rate scheduler
+		schedG = None
+		if self.use_scheduler:
+			schedG = CosineAnnealingLR(optimG, T_max=num_epoch, eta_min=lr_G * 0.01)
+			print(f"Cosine annealing scheduler enabled (T_max={num_epoch}, eta_min={lr_G * 0.01})")
+
 		## load from checkpoints
 		st_epoch = 0
 
@@ -218,21 +246,26 @@ class Train:
 
 				label = data['label'].to(device, non_blocking=True, memory_format=torch.channels_last)
 				input = data['input'].to(device, non_blocking=True, memory_format=torch.channels_last)
-				
-				# backward netG
-				output = netG(input)
-				loss_G = fn_REG(output, label)
-				loss_G.backward()
-				optimG.step()
+
+				# backward netG with mixed precision
+				optimG.zero_grad()
+				with autocast('cuda', enabled=self.use_amp):
+					output = netG(input)
+				# Compute loss outside autocast (torchmetrics doesn't support mixed dtypes)
+				loss_G = fn_REG(output.float(), label)
+
+				scaler.scale(loss_G).backward()
+				scaler.step(optimG)
+				scaler.update()
 
 				# get losses
 				loss_G_train += [loss_G.item()]
 
-
 				print('TRAIN: EPOCH %d: BATCH %04d/%04d: LOSS: %.4f'
 					  % (epoch, batch, num_batch_train, np.mean(loss_G_train)))
 
-				if should(num_freq_disp):
+				# Only save images if explicitly requested (disabled by default for speed)
+				if self.save_images and should(num_freq_disp):
 					## show output
 					input = transform_inv(input)
 					label = transform_inv(label)
@@ -275,17 +308,19 @@ class Train:
 					label = data['label'].to(device, non_blocking=True, memory_format=torch.channels_last)
 					input = data['input'].to(device, non_blocking=True, memory_format=torch.channels_last)
 
-					# forward netG
-					output = netG(input)
-
-					loss_G = fn_REG(output, label)
+					# forward netG with mixed precision
+					with autocast('cuda', enabled=self.use_amp):
+						output = netG(input)
+					# Compute loss outside autocast (torchmetrics doesn't support mixed dtypes)
+					loss_G = fn_REG(output.float(), label)
 
 					loss_G_val += [loss_G.item()]
 
 					print('VALID: EPOCH %d: BATCH %04d/%04d: LOSS: %.4f'
 						  % (epoch, batch, num_batch_val, np.mean(loss_G_val)))
 
-					if should(num_freq_disp):
+					# Only save images if explicitly requested (disabled by default for speed)
+					if self.save_images and should(num_freq_disp):
 						## show output
 						input = transform_inv(input)
 						label = transform_inv(label)
@@ -315,9 +350,9 @@ class Train:
 				# DISABLED LOGGING
 				# writer_val.add_scalar('loss_G', np.mean(loss_G_val), epoch)
 
-			# update schduler
-			# schedG.step()
-			# schedD.step()
+			# Update learning rate scheduler
+			if schedG is not None:
+				schedG.step()
 
 			## save
 			if (epoch % num_freq_save) == 0:
@@ -427,10 +462,12 @@ class Train:
 				label = data['label'].to(device, non_blocking=True, memory_format=torch.channels_last)
 				input = data['input'].to(device, non_blocking=True, memory_format=torch.channels_last)
 
-				# Use sliding window inference instead of direct forward pass
-				output = inferer(input, netG)
+				# Use sliding window inference with mixed precision
+				with autocast('cuda', enabled=self.use_amp):
+					output = inferer(input, netG)
+				# Compute loss outside autocast (torchmetrics doesn't support mixed dtypes)
+				loss_G = fn_REG(output.float(), label)
 
-				loss_G = fn_REG(output, label)
 				loss_G_test += [loss_G.item()]
 
 				# Convert back to numpy for saving
