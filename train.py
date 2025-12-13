@@ -1,6 +1,9 @@
 from model import *
+from restormer import Restormer
 from model import init_net
 from dataset import *
+
+import cv2
 
 import torch
 import torch.nn as nn
@@ -19,14 +22,12 @@ from torchmetrics.image import RelativeAverageSpectralError
 from torchmetrics.image import PeakSignalNoiseRatio
 import albumentations as A
 
-##
 class Train:
 	def __init__(self, args):
 		self.mode = args.mode
 		self.train_continue = args.train_continue
 
 		self.scope = args.scope
-		self.norm = args.norm
 
 		self.dir_checkpoint = args.dir_checkpoint
 		self.dir_log = args.dir_log
@@ -47,10 +48,6 @@ class Train:
 		self.nx_load = args.nx_load
 		self.nch_load = args.nch_load
 
-		self.ny_out = args.ny_out
-		self.nx_out = args.nx_out
-		self.nch_out = args.nch_out
-
 		self.data_type = args.data_type
 
 		self.num_freq_disp = args.num_freq_disp
@@ -62,6 +59,7 @@ class Train:
 		self.use_grad_checkpoint = getattr(args, 'use_grad_checkpoint', True)
 		self.use_scheduler = getattr(args, 'use_scheduler', True)
 		self.save_images = getattr(args, 'save_images', False)
+		torch.set_float32_matmul_precision('high')
 
 		self.gpu_ids = args.gpu_ids
 
@@ -97,18 +95,24 @@ class Train:
 
 		print('Loaded %dth network' % epoch)
 
-		if mode == 'train':
-			netG.load_state_dict(dict_net['netG'])
-			optimG.load_state_dict(dict_net['optimG'])
+		# Handle torch.compile() prefix (_orig_mod.)
+		state_dict = dict_net['netG']
+		if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+			state_dict = {key.replace('_orig_mod.', ''): value
+						for key, value in state_dict.items()}
+			print("Removed '_orig_mod.' prefix from state dict keys")
 
+		if mode == 'train':
+			netG.load_state_dict(state_dict)
+			optimG.load_state_dict(dict_net['optimG'])
 			return netG, optimG, epoch
 
 		elif mode == 'test':
-			netG.load_state_dict(dict_net['netG'])
-
+			netG.load_state_dict(state_dict)
 			return netG, epoch
 
 	def train(self):
+		use_checkpoint = self.use_grad_checkpoint # Enable gradient checkpointing for memory efficiency if requested
 		mode = self.mode
 
 		train_continue = self.train_continue
@@ -121,9 +125,6 @@ class Train:
 
 		gpu_ids = self.gpu_ids
 
-		nch_out = self.nch_out
-
-		norm = self.norm
 		name_data = self.name_data
 
 		num_freq_disp = self.num_freq_disp
@@ -149,7 +150,7 @@ class Train:
 		transform_val = transforms.Compose([Normalize(mean=0.5, std=0.5), RandomFlip(), RandomCrop((self.ny_load, self.nx_load)), ToTensor()])
 
 		# Albumentations transforms for training and validation
-		
+
 	# 	transform_train = A.Compose([
 	# 		A.D4(p=1.0), #https://explore.albumentations.ai/transform/D4
 			# A.ColorJitter(brightness=(0.8, 1.2), contrast=(0.8, 1.2), saturation=(0.8, 1.2), p=0.5), #https://explore.albumentations.ai/transform/ColorJitter
@@ -173,11 +174,11 @@ class Train:
 
 		transform_inv = transforms.Compose([ToNumpy(), Denormalize(mean=0.5, std=0.5)])
 
-		dataset_train = Dataset(dir_data_train, data_type=self.data_type, transform=transform_train, sgm=(26, 26))
-		dataset_val = Dataset(dir_data_val, data_type=self.data_type, transform=transform_val, sgm=(26, 26))
+		dataset_train = Dataset(dir_data_train, data_type=self.data_type, transform=transform_train, sgm=(52, 52))
+		dataset_val = Dataset(dir_data_val, data_type=self.data_type, transform=transform_val, sgm=(52, 52))
 
-		loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=4)
-		loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+		loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=batch_size, pin_memory=True, persistent_workers=True, prefetch_factor=4, in_order=False)
+		loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=batch_size, shuffle=True, num_workers=batch_size, pin_memory=True, persistent_workers=True, prefetch_factor=4, in_order=False)
 
 		num_train = len(dataset_train)
 		num_val = len(dataset_val)
@@ -187,12 +188,9 @@ class Train:
 
 		## setup network
 		# netG = BasicUNetPlusPlus(spatial_dims=2, in_channels=1, out_channels=1, features=(64,64,128,256,512,64))
-		# netG = ELUNetPlusPlusPlus(spatial_dims=2, in_channels=1, out_channels=1, features=(32,32,64,128,256,32))
-		# netG = ELUNet(spatial_dims=2, in_channels=1, out_channels=1, features=(32,32,64,128,256,32))
-		# Enable gradient checkpointing for memory efficiency if requested
-		use_checkpoint = self.use_grad_checkpoint
-		netG = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24, use_v2=True, use_checkpoint=use_checkpoint)
-		# netG = SwinUNETRPlusPlus(img_size=(self.ny_load, self.nx_load), spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24,num_heads=(6,12,24,48), use_v2=True, drop_rate=0.2, attn_drop_rate=0.2, dropout_path_rate=0.2, downsample="mergingv2")
+		netG = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=48, use_v2=True)
+		#netG = DeepSwinUNETR(img_size=(self.ny_load, self.nx_load), spatial_dims=2, in_channels=1, out_channels=1, use_v2=True, downsample="mergingv2")
+		#netG = Restormer(spatial_dims=2, in_channels=1, out_channels=1) #, dim=48, num_blocks=(4, 6, 6, 8), heads=(1, 2, 4, 8), num_refinement_blocks=4,)
 		netG = netG.to(memory_format=torch.channels_last)
 
 		init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
@@ -200,14 +198,12 @@ class Train:
 		# Apply torch.compile for faster training (PyTorch 2.0+)
 		if self.use_compile:
 			print("Compiling model with torch.compile()...")
-			netG = torch.compile(netG, mode='reduce-overhead')
+			netG = torch.compile(netG, mode='default')
 
 		## setup loss & optimization
 		# fn_REG = nn.L1Loss().to(device)  # Regression loss: L1
 		# fn_REG1 = nn.MSELoss().to(device)	 # Regression loss: L2
-		# fn_REG1 = DeepImageStructureAndTextureSimilarity().to(device)
-		fn_REG = RootMeanSquaredErrorUsingSlidingWindow().to(device)
-		# fn_REG2 = PeakSignalNoiseRatio(data_range=1.0).to(device)
+		fn_REG = RootMeanSquaredErrorUsingSlidingWindow(window_size=4).to(device) + RootMeanSquaredErrorUsingSlidingWindow(window_size=16).to(device)
 		paramsG = netG.parameters()
 
 		optimG = torch.optim.Adam(paramsG, lr=lr_G, betas=(self.beta1, 0.999), fused=True)
@@ -250,7 +246,7 @@ class Train:
 				# backward netG with mixed precision
 				optimG.zero_grad()
 				with autocast('cuda', enabled=self.use_amp):
-					output = netG(input)
+					output = netG(input)  # Second pass
 				# Compute loss outside autocast (torchmetrics doesn't support mixed dtypes)
 				loss_G = fn_REG(output.float(), label)
 
@@ -274,10 +270,6 @@ class Train:
 					input = np.clip(input, 0, 1)
 					label = np.clip(label, 0, 1)
 					output = np.clip(output, 0, 1)
-					#DISABLED LOGGING
-					# writer_train.add_images('input', input, num_batch_train * (epoch - 1) + batch, dataformats='NHWC')
-					# writer_train.add_images('output', output, num_batch_train * (epoch - 1) + batch, dataformats='NHWC')
-					# writer_train.add_images('label', label, num_batch_train * (epoch - 1) + batch, dataformats='NHWC')
 
 					for j in range(label.shape[0]):
 						# name = num_train * (epoch - 1) + num_batch_train * (batch - 1) + j
@@ -329,10 +321,6 @@ class Train:
 						input = np.clip(input, 0, 1)
 						label = np.clip(label, 0, 1)
 						output = np.clip(output, 0, 1)
-						# DISABLED LOGGING
-						# writer_val.add_images('input', input, num_batch_val * (epoch - 1) + batch, dataformats='NHWC')
-						# writer_val.add_images('output', output, num_batch_val * (epoch - 1) + batch, dataformats='NHWC')
-						# writer_val.add_images('label', label, num_batch_val * (epoch - 1) + batch, dataformats='NHWC')
 
 						for j in range(label.shape[0]):
 							# name = num_train * (epoch - 1) + num_batch_train * (batch - 1) + j
@@ -364,14 +352,12 @@ class Train:
 	def test(self):
 		"""Modified test function using MONAI SlidingWindowInferer"""
 		from monai.inferers import SlidingWindowInferer
-		
+
 		mode = self.mode
 		batch_size = self.batch_size
 		device = self.device
 		gpu_ids = self.gpu_ids
 
-		nch_out = self.nch_out
-		norm = self.norm
 		name_data = self.name_data
 
 		## setup dataset
@@ -387,7 +373,7 @@ class Train:
 
 		# Create dataset without any augmentations for test mode
 		class FullImageDataset(torch.utils.data.Dataset):
-			def __init__(self, data_dir, sgm=(0, 26)):
+			def __init__(self, data_dir, sgm=(0, 52)):
 				self.data_dir = data_dir
 				self.sgm_input = sgm[1]
 
@@ -423,15 +409,14 @@ class Train:
 			def __len__(self):
 				return len(self.lst_data)
 
-		dataset_test = FullImageDataset(dir_data_test, sgm=(0, 26))
+		dataset_test = FullImageDataset(dir_data_test, sgm=(0, 52))
 		loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=1, shuffle=False, pin_memory=True)
 
 		## setup network
-		# netG = ELUNet(spatial_dims=2, in_channels=1, out_channels=1, features=(64,64,128,256,512,64))
-		# netG = ELUNetPlusPlusPlus(spatial_dims=2, in_channels=1, out_channels=1, features=(32,32,64,128,256,32))
 		# netG = BasicUNetPlusPlus(spatial_dims=2, in_channels=1, out_channels=1, features=(64,64,128,256,512,64))
-		netG = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24, use_v2=True)
-		# netG = SwinUNETRPlusPlus(img_size=(self.ny_load, self.nx_load), spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=24,num_heads=(6,12,24,48), use_v2=True, drop_rate=0.2, attn_drop_rate=0.2, dropout_path_rate=0.2, downsample="mergingv2")
+		netG = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=1, depths=(3,3,3,3), feature_size=48, use_v2=True)
+		#netG = DeepSwinUNETR(img_size=(self.ny_load, self.nx_load), spatial_dims=2, in_channels=1, out_channels=1, use_v2=True, downsample="mergingv2")
+		# netG = Restormer(spatial_dims=2, in_channels=1, out_channels=1) #, dim=48, num_blocks=(4, 6, 6, 8), heads=(1, 2, 4, 8), num_refinement_blocks=4,)
 		netG = netG.to(memory_format=torch.channels_last)
 		init_net(netG, init_type='normal', init_gain=0.02, gpu_ids=gpu_ids)
 
@@ -444,14 +429,12 @@ class Train:
 			sw_batch_size=batch_size,  # Process multiple patches at once
 			overlap=0.75,	 # 25% overlap between patches
 			mode='gaussian',  # Use gaussian blending for smoother results
-			padding_mode='reflect'  # Padding for edge cases
+			padding_mode='replicate'
 		)
 
 		## setup loss function
 		# fn_REG = nn.L1Loss().to(device)
-		# fn_REG = ARNIQA().to(device)
-		fn_REG = RootMeanSquaredErrorUsingSlidingWindow().to(device)
-		# fn_REG = fn_REG1 + fn_REG2
+		fn_REG = RootMeanSquaredErrorUsingSlidingWindow(window_size=4).to(device) + RootMeanSquaredErrorUsingSlidingWindow(window_size=16).to(device)
 
 		## test phase
 		with torch.no_grad():
@@ -464,7 +447,8 @@ class Train:
 
 				# Use sliding window inference with mixed precision
 				with autocast('cuda', enabled=self.use_amp):
-					output = inferer(input, netG)
+					output = inferer(input, netG)  # Single inferer call
+
 				# Compute loss outside autocast (torchmetrics doesn't support mixed dtypes)
 				loss_G = fn_REG(output.float(), label)
 
@@ -472,7 +456,7 @@ class Train:
 
 				# Convert back to numpy for saving
 				input = transform_inv(input)
-				label = transform_inv(label)  
+				label = transform_inv(label)
 				output = transform_inv(output)
 
 				input = np.clip(input, 0, 1)
@@ -496,30 +480,15 @@ class Train:
 					# append_index(dir_result_test, fileset)
 
 				print('TEST: %d/%d: LOSS: %.6f' % (i, len(loader_test), loss_G.item()))
-				
+
 			print('TEST: AVERAGE LOSS: %.6f' % (np.mean(loss_G_test)))
-
-
-def set_requires_grad(nets, requires_grad=False):
-	"""Set requies_grad=Fasle for all the networks to avoid unnecessary computations
-	Parameters:
-		nets (network list)   -- a list of networks
-		requires_grad (bool)  -- whether the networks require gradients or not
-	"""
-	if not isinstance(nets, list):
-		nets = [nets]
-	for net in nets:
-		if net is not None:
-			for param in net.parameters():
-				param.requires_grad = requires_grad
-
 
 def get_scheduler(optimizer, opt):
 	"""Return a learning rate scheduler
 
 	Parameters:
 		optimizer		  -- the optimizer of the network
-		opt (option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions．　
+		opt (option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions．
 							  opt.lr_policy is the name of learning rate policy: linear | step | plateau | cosine
 
 	For 'linear', we keep the same learning rate for the first <opt.n_epochs> epochs
